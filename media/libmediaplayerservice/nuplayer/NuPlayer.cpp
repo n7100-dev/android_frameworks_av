@@ -660,7 +660,10 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
             // When mStarted is true, mSource must have been set.
             if (mSource == NULL || !mStarted || mSource->getFormat(false /* audio */) == NULL
                     // NOTE: mVideoDecoder's mSurface is always non-null
-                    || (mVideoDecoder != NULL && mVideoDecoder->setVideoSurface(surface) == OK)) {
+#ifndef CANNOT_SET_SURFACE_WITHOUT_A_FLUSH
+                    || (mVideoDecoder != NULL && mVideoDecoder->setVideoSurface(surface) == OK)
+#endif
+                ) {
                 performSetSurface(surface);
                 break;
             }
@@ -932,10 +935,21 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
                         audio ? "audio" : "video", formatChange);
 
                 if (formatChange) {
-                    mDeferredActions.push_back(
-                            new FlushDecoderAction(
+                    int32_t seamlessChange = 0;
+                    if (msg->findInt32("video-seamlessChange", &seamlessChange) && seamlessChange) {
+                        ALOGE("video decoder seamlessChange in smooth streaming mode, "
+                             "flush the video decoder");
+                        mDeferredActions.push_back(
+                                new FlushDecoderAction(FLUSH_CMD_NONE, FLUSH_CMD_FLUSH));
+                        mDeferredActions.push_back(new ResumeDecoderAction(false));
+                        processDeferredActions();
+                        break;
+                    } else {
+                        mDeferredActions.push_back(
+                                new FlushDecoderAction(
                                 audio ? FLUSH_CMD_SHUTDOWN : FLUSH_CMD_NONE,
                                 audio ? FLUSH_CMD_NONE : FLUSH_CMD_SHUTDOWN));
+                    }
                 }
 
                 mDeferredActions.push_back(
@@ -1488,16 +1502,22 @@ void NuPlayer::postScanSources() {
 void NuPlayer::tryOpenAudioSinkForOffload(const sp<AMessage> &format, bool hasVideo) {
     // Note: This is called early in NuPlayer to determine whether offloading
     // is possible; otherwise the decoders call the renderer openAudioSink directly.
-
+    sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
+    sp<AMessage> pcmFormat;
+    if (mOffloadDecodedPCM) {
+        sp<MetaData> pcm = AVNuUtils::get()->createPCMMetaFromSource(audioMeta);
+        audioMeta = pcm;
+        convertMetaDataToMessage(pcm, &pcmFormat);
+    }
     status_t err = mRenderer->openAudioSink(
-            format, true /* offloadOnly */, hasVideo, AUDIO_OUTPUT_FLAG_NONE, &mOffloadAudio, mSource->isStreaming());
+            mOffloadDecodedPCM ? pcmFormat : format,
+            true /* offloadOnly */, hasVideo, AUDIO_OUTPUT_FLAG_NONE,
+            &mOffloadAudio, mSource->isStreaming());
     if (err != OK) {
         // Any failure we turn off mOffloadAudio.
         mOffloadAudio = false;
         mOffloadDecodedPCM = false;
     } else if (mOffloadAudio) {
-        sp<MetaData> audioMeta =
-                mSource->getFormatMeta(true /* audio */);
         sendMetaDataToHal(mAudioSink, audioMeta);
     }
 }
